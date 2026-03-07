@@ -37,7 +37,7 @@ def bytes_to_cv2(img_bytes: bytes) -> np.ndarray:
 def bytes_to_pil(img_bytes: bytes) -> Image.Image:
     """
     Convert raw image bytes → PIL Image (RGB).
-    Used by pyzbar and Gemini.
+    Used by pyzbar and AI context engine.
     """
     try:
         pil = Image.open(io.BytesIO(img_bytes))

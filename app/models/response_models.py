@@ -88,7 +88,7 @@ class TechnicalLayerResult(BaseModel):
 #  LAYER 3 — AI CONTEXT ANALYSIS
 
 class AILayerResult(BaseModel):
-    visual_context:           str      = Field(..., description="What Gemini sees in the image")
+    visual_context:           str      = Field(..., description="What AI sees in the image")
     expected_brand:           str      = Field(..., description="Brand/org suggested by visual")
     url_match:                URLMatch = Field(..., description="Does URL match expected brand?")
     impersonation_probability: float   = Field(..., ge=0.0, le=1.0, description="0.0 to 1.0")

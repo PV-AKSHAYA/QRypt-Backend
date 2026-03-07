@@ -88,7 +88,7 @@ def print_result(label: str, data: dict) -> None:
     print()
     print(f"  {BOLD}Technical Layer{RESET}")
     print(f"    Final URL  : {tech['final_url'][:60]}")
-    print(f"    Hops       : {tech['hop_count']}")
+    print(f"    Redirect       : {tech['hop_count']}")
     print(f"    SSL Valid  : {tech['ssl_valid']}")
     print(f"    TLD Risk   : {tech['tld_risk_score']}")
     print(f"    Keywords   : {tech['suspicious_keywords']}")

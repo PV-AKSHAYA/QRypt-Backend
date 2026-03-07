@@ -10,8 +10,9 @@ class Settings(BaseSettings):
     PORT: int = 8000
 
     # API KEYS  
-    GEMINI_API_KEY: str = ""
+    OPENAI_API_KEY: str = ""
     VIRUSTOTAL_API_KEY: str = ""
+    GROQ_API_KEY: str = ""
 
     # MONGO_DB
     MONGODB_URI: str = ""

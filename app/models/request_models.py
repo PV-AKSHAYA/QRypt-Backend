@@ -32,8 +32,8 @@ class ScanRequest(BaseModel):
         description="Skip VirusTotal check for faster response (reduces accuracy)",
     )
 
-    # Skip AI context engine (saves Gemini quota)
+    # Skip AI context engine
     skip_ai: bool = Field(
         False,
-        description="Skip Gemini AI context analysis",
+        description="Skip AI context analysis",
     )

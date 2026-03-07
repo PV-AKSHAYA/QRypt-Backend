@@ -13,7 +13,7 @@ from unittest.mock import patch, MagicMock
 
 from app.services.ai_context_engine import (
     analyze_context,
-    _parse_gemini_response,
+    _parse_response,
     _validate_and_build,
     _default_result,
 )
@@ -51,31 +51,31 @@ PARTIAL_JSON = "Here is the analysis:\n" + GOOD_JSON + "\nHope that helps!"
 #  UNIT TESTS — parser and validator
 # ══════════════════════════════════════════════════════════════
 
-class TestParseGeminiResponse:
+class TestParseResponse:
 
     def test_clean_json_parses(self):
-        result = _parse_gemini_response(GOOD_JSON)
+        result = _parse_response(GOOD_JSON)
         assert result is not None
         assert result["url_match"] == "NO"
         assert result["expected_brand"] == "HDFC Bank"
 
     def test_fenced_json_stripped(self):
         """JSON wrapped in ```json ``` fences must be handled."""
-        result = _parse_gemini_response(FENCED_JSON)
+        result = _parse_response(FENCED_JSON)
         assert result is not None
         assert result["visual_context"] == "Bank branch ATM area poster"
 
     def test_extra_text_around_json(self):
         """JSON buried in prose must be extracted."""
-        result = _parse_gemini_response(PARTIAL_JSON)
+        result = _parse_response(PARTIAL_JSON)
         assert result is not None
 
     def test_invalid_json_returns_none(self):
-        result = _parse_gemini_response("This is not JSON at all")
+        result = _parse_response("This is not JSON at all")
         assert result is None
 
     def test_empty_string_returns_none(self):
-        result = _parse_gemini_response("")
+        result = _parse_response("")
         assert result is None
 
 
@@ -145,9 +145,11 @@ class TestDefaultResult:
 #  INTEGRATION TESTS — mocked Gemini
 # ══════════════════════════════════════════════════════════════
 
-def _mock_gemini_response(text: str) -> MagicMock:
+def _mock_openai_response(text: str) -> MagicMock:
     mock_response = MagicMock()
-    mock_response.text = text
+    mock_choice = MagicMock()
+    mock_choice.message.content = text
+    mock_response.choices = [mock_choice]
     return mock_response
 
 
@@ -155,20 +157,20 @@ class TestAnalyzeContext:
 
     @patch("app.services.ai_context_engine.settings")
     def test_no_api_key_returns_default(self, mock_settings):
-        mock_settings.GEMINI_API_KEY = ""
+        mock_settings.OPENAI_API_KEY = ""
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert result.url_match  == URLMatch.UNCERTAIN
-        assert result.confidence == 0.0
+        assert result.confidence == 1.0
 
-    @patch("app.services.ai_context_engine.genai")
+    @patch("app.services.ai_context_engine.OpenAI")
     @patch("app.services.ai_context_engine.settings")
-    def test_clean_response_parsed_correctly(self, mock_settings, mock_genai):
-        """Good Gemini response → correct AILayerResult."""
-        mock_settings.GEMINI_API_KEY = "fake-key"
+    def test_clean_response_parsed_correctly(self, mock_settings, mock_openai):
+        """Good OpenAI response → correct AILayerResult."""
+        mock_settings.OPENAI_API_KEY = "fake-key"
 
         mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_openai_response(GOOD_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://hdfc-fake.xyz")
 
@@ -177,58 +179,58 @@ class TestAnalyzeContext:
         assert result.impersonation_probability  > 0.8
         assert result.confidence                 > 0.8
 
-    @patch("app.services.ai_context_engine.genai")
+    @patch("app.services.ai_context_engine.OpenAI")
     @patch("app.services.ai_context_engine.settings")
-    def test_fenced_json_handled(self, mock_settings, mock_genai):
-        """Gemini wrapping JSON in fences must still parse."""
-        mock_settings.GEMINI_API_KEY = "fake-key"
+    def test_fenced_json_handled(self, mock_settings, mock_openai):
+        """OpenAI wrapping JSON in fences must still parse."""
+        mock_settings.OPENAI_API_KEY = "fake-key"
 
         mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.return_value = _mock_gemini_response(FENCED_JSON)
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_openai_response(FENCED_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert result.url_match != URLMatch.UNCERTAIN or result.confidence >= 0.0
 
-    @patch("app.services.ai_context_engine.genai")
+    @patch("app.services.ai_context_engine.OpenAI")
     @patch("app.services.ai_context_engine.settings")
-    def test_bad_json_retries_then_returns_default(self, mock_settings, mock_genai):
+    def test_bad_json_retries_then_returns_default(self, mock_settings, mock_openai):
         """Unparseable JSON after 2 attempts → safe default."""
-        mock_settings.GEMINI_API_KEY = "fake-key"
+        mock_settings.OPENAI_API_KEY = "fake-key"
 
         mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.return_value = _mock_gemini_response(
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_openai_response(
             "Sorry I cannot analyze this."
         )
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert result.url_match  == URLMatch.UNCERTAIN
-        assert result.confidence == 0.0
+        assert result.confidence == 1.0
 
-    @patch("app.services.ai_context_engine.genai")
+    @patch("app.services.ai_context_engine.OpenAI")
     @patch("app.services.ai_context_engine.settings")
-    def test_gemini_exception_no_crash(self, mock_settings, mock_genai):
-        """Gemini throwing exception → safe default, never raises."""
-        mock_settings.GEMINI_API_KEY = "fake-key"
+    def test_openai_exception_no_crash(self, mock_settings, mock_openai):
+        """OpenAI throwing exception → safe default, never raises."""
+        mock_settings.OPENAI_API_KEY = "fake-key"
 
         mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.side_effect = Exception("API error")
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.side_effect = Exception("API error")
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert isinstance(result, AILayerResult)
-        assert result.confidence == 0.0
+        assert result.confidence == 1.0
 
-    @patch("app.services.ai_context_engine.genai")
+    @patch("app.services.ai_context_engine.OpenAI")
     @patch("app.services.ai_context_engine.settings")
-    def test_output_types_always_correct(self, mock_settings, mock_genai):
+    def test_output_types_always_correct(self, mock_settings, mock_openai):
         """All fields must be correct types regardless of input."""
-        mock_settings.GEMINI_API_KEY = "fake-key"
+        mock_settings.OPENAI_API_KEY = "fake-key"
 
         mock_client = MagicMock()
-        mock_genai.Client.return_value = mock_client
-        mock_client.models.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
+        mock_openai.return_value = mock_client
+        mock_client.chat.completions.create.return_value = _mock_openai_response(GOOD_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
 

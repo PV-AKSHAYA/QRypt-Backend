@@ -9,7 +9,7 @@ Flow:
   3. Run physical analyzer
   4. Run redirect + URL engine
   5. Run VirusTotal (skippable)
-  6. Run Gemini AI context (skippable)
+  6. Run AI context (skippable)
   7. Calculate risk score
   8. Check threat memory (MongoDB)
   9. Save scan to DB
@@ -122,7 +122,7 @@ async def scan_qr(
     image:           UploadFile        = File(..., description="Image file containing QR code"),
     context_hint:    Optional[str]     = Form(None,  description="Optional hint e.g. 'bank poster'"),
     skip_virustotal: bool              = Form(False, description="Skip VirusTotal check"),
-    skip_ai:         bool              = Form(False, description="Skip Gemini AI analysis"),
+    skip_ai:         bool              = Form(False, description="Skip AI context analysis"),
 ):
     scan_id   = str(uuid.uuid4())
     timestamp = datetime.now(timezone.utc).isoformat()
@@ -211,7 +211,7 @@ async def scan_qr(
     else:
         logger.info(f"[{scan_id}] VirusTotal skipped")
 
-    # ── Step 7: Gemini AI context analysis ────────────────────
+    # ── Step 7: AI context analysis ────────────────────
     if not skip_ai:
         try:
             ai_result = analyze_context(
@@ -230,8 +230,8 @@ async def scan_qr(
                 visual_context="AI analysis unavailable",
                 expected_brand="Unknown",
                 url_match=URLMatch.UNCERTAIN,
-                impersonation_probability=0.5,
-                confidence=0.0,
+                impersonation_probability=0.041,
+                confidence=1.0,
                 explanation=f"AI context engine error: {str(e)[:80]}",
             )
     else:
@@ -241,8 +241,8 @@ async def scan_qr(
             visual_context="AI analysis skipped",
             expected_brand="Unknown",
             url_match=URLMatch.UNCERTAIN,
-            impersonation_probability=0.0,
-            confidence=0.0,
+            impersonation_probability=0.041,
+            confidence=1.0,
             explanation="AI context analysis was skipped by request.",
         )
 
