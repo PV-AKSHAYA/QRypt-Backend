@@ -39,25 +39,44 @@ client = TestClient(app, raise_server_exceptions=False)
 # ══════════════════════════════════════════════════════════════
 
 def make_qr_image(url: str) -> bytes:
-    """Clean QR code on white background."""
-    img = qrcode.make(url)
+    """Clean QR code with generous white padding to avoid edge artifacts."""
+    qr = qrcode.QRCode(border=10)   # More border to separate from image edge
+    qr.add_data(url)
+    qr.make(fit=True)
+    img = qr.make_image(fill_color="black", back_color="white")
     buf = io.BytesIO()
     img.save(buf, format="PNG")
     return buf.getvalue()
 
 
 def make_tampered_qr_image(url: str) -> bytes:
-    """QR with sticker overlay — triggers physical analyzer."""
-    qr  = qrcode.make(url).resize((300, 300))
+    """QR with a small sticker overlay — triggers physical analyzer but stays readable."""
+    qr = qrcode.QRCode(border=4)
+    qr.add_data(url)
+    qr.make(fit=True)
+    # Use NEAREST to keep modules sharp
+    qr_img = qr.make_image().convert("RGB").resize((300, 300), Image.Resampling.NEAREST)
+    
     canvas = Image.new("RGB", (400, 400), "white")
-    canvas.paste(qr, (50, 50))
+    canvas.paste(qr_img, (50, 50))
 
     draw = ImageDraw.Draw(canvas)
-    # Sticker overlay with double-edge signature
-    draw.rectangle([90,  90,  270, 270], outline="black", width=5)
-    draw.rectangle([95,  95,  265, 265], fill=(235, 235, 235))
-    draw.rectangle([110, 110, 250, 250], outline="black", width=4)
-    draw.rectangle([115, 115, 245, 245], fill=(200, 200, 200))
+    # Move sticker even more to the edge
+    # QR is at (50, 50) to (350, 350).
+    # Sticker from (240, 240) to (340, 340)
+    rects = [
+        [240, 240, 340, 340],
+        [245, 245, 335, 335],
+        [250, 250, 330, 330],
+        [255, 255, 325, 325],
+        [260, 260, 320, 320],
+        [265, 265, 315, 315],
+    ]
+    for i, rect in enumerate(rects):
+        if i % 2 == 0:
+            draw.rectangle(rect, outline="black", width=4)   # Increased width
+        else:
+            draw.rectangle(rect, fill=(240, 240, 240))
 
     buf = io.BytesIO()
     canvas.save(buf, format="PNG")
@@ -322,11 +341,13 @@ class TestScenario3HighRisk:
     @patch("app.api.scan.analyze_context",  return_value=mock_ai_dangerous())
     def test_vt_engines_in_response(self, mock_ai, mock_vt):
         """VT malicious count must appear in technical layer."""
-        img_bytes = make_tampered_qr_image("https://phishing.xyz/login")
+        # Use a readable URL
+        img_bytes = make_tampered_qr_image("https://taxrefund-claim.xyz/pay")
         r = client.post(
             "/api/v1/scan",
             files={"image": ("bad.png", img_bytes, "image/png")},
         )
+        assert r.status_code == 200
         data = r.json()
         assert data["technical_layer"]["virustotal"]["malicious"] == 5
 
@@ -334,11 +355,13 @@ class TestScenario3HighRisk:
     @patch("app.api.scan.analyze_context",  return_value=mock_ai_dangerous())
     def test_ai_mismatch_in_response(self, mock_ai, mock_vt):
         """AI url_match=NO must appear in ai_layer."""
-        img_bytes = make_tampered_qr_image("https://irs-tax-claim.xyz")
+        # Use same URL as verdict test to ensure consistency and readability
+        img_bytes = make_tampered_qr_image("https://taxrefund-claim.xyz/pay")
         r = client.post(
             "/api/v1/scan",
             files={"image": ("bad.png", img_bytes, "image/png")},
         )
+        assert r.status_code == 200
         data = r.json()
         assert data["ai_layer"]["url_match"] == "NO"
         assert data["ai_layer"]["impersonation_probability"] > 0.8

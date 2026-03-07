@@ -166,10 +166,9 @@ class TestAnalyzeContext:
         """Good Gemini response → correct AILayerResult."""
         mock_settings.GEMINI_API_KEY = "fake-key"
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
-        mock_genai.GenerativeModel.return_value  = mock_model
-        mock_genai.GenerationConfig              = MagicMock()
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+        mock_client.models.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://hdfc-fake.xyz")
 
@@ -184,10 +183,9 @@ class TestAnalyzeContext:
         """Gemini wrapping JSON in fences must still parse."""
         mock_settings.GEMINI_API_KEY = "fake-key"
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = _mock_gemini_response(FENCED_JSON)
-        mock_genai.GenerativeModel.return_value  = mock_model
-        mock_genai.GenerationConfig              = MagicMock()
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+        mock_client.models.generate_content.return_value = _mock_gemini_response(FENCED_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert result.url_match != URLMatch.UNCERTAIN or result.confidence >= 0.0
@@ -198,12 +196,11 @@ class TestAnalyzeContext:
         """Unparseable JSON after 2 attempts → safe default."""
         mock_settings.GEMINI_API_KEY = "fake-key"
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = _mock_gemini_response(
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+        mock_client.models.generate_content.return_value = _mock_gemini_response(
             "Sorry I cannot analyze this."
         )
-        mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.GenerationConfig             = MagicMock()
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert result.url_match  == URLMatch.UNCERTAIN
@@ -215,10 +212,9 @@ class TestAnalyzeContext:
         """Gemini throwing exception → safe default, never raises."""
         mock_settings.GEMINI_API_KEY = "fake-key"
 
-        mock_model = MagicMock()
-        mock_model.generate_content.side_effect = Exception("API error")
-        mock_genai.GenerativeModel.return_value = mock_model
-        mock_genai.GenerationConfig             = MagicMock()
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+        mock_client.models.generate_content.side_effect = Exception("API error")
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
         assert isinstance(result, AILayerResult)
@@ -230,10 +226,9 @@ class TestAnalyzeContext:
         """All fields must be correct types regardless of input."""
         mock_settings.GEMINI_API_KEY = "fake-key"
 
-        mock_model = MagicMock()
-        mock_model.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
-        mock_genai.GenerativeModel.return_value  = mock_model
-        mock_genai.GenerationConfig              = MagicMock()
+        mock_client = MagicMock()
+        mock_genai.Client.return_value = mock_client
+        mock_client.models.generate_content.return_value = _mock_gemini_response(GOOD_JSON)
 
         result = analyze_context(make_blank_image_bytes(), "https://example.com")
 
