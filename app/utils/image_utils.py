@@ -1,163 +1,125 @@
 """
-app/utils/image_utils.py
-─────────────────────────
-All image loading, preprocessing, and conversion helpers.
-Every service that touches an image imports from here.
-Never do raw cv2/PIL operations outside this file.
+SafeQR — image_utils.py
+Low-level image handling. Load, validate, hash, preprocess.
+All functions are pure — no side effects, no state.
 """
+
+import hashlib
+import io
+import logging
+from typing import Tuple, Optional
 
 import cv2
 import numpy as np
-from PIL import Image
-import io
-import hashlib
-import logging
 
-logger = logging.getLogger("safeqr.image_utils")
+logger = logging.getLogger(__name__)
+
+# Max image dimension we'll process (resize above this)
+MAX_DIMENSION = 2048
+# Min dimension — anything smaller is likely garbage
+MIN_DIMENSION = 64
+# Allowed MIME types
+ALLOWED_MIME = {"image/jpeg", "image/png", "image/webp", "image/bmp", "image/tiff"}
 
 
-# ══════════════════════════════════════════════════════════════
-#  LOAD
-# ══════════════════════════════════════════════════════════════
+class ImageLoadError(Exception):
+    """Raised when an image cannot be decoded or is invalid."""
+    pass
 
-def bytes_to_cv2(img_bytes: bytes) -> np.ndarray:
+
+def load_image_from_bytes(raw: bytes) -> np.ndarray:
     """
-    Convert raw image bytes → OpenCV BGR numpy array.
-    Raises ValueError if bytes are not a valid image.
+    Decode raw bytes → OpenCV BGR ndarray.
+    Raises ImageLoadError on failure.
     """
-    if not img_bytes:
-        raise ValueError("Empty image received")
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
+    if not raw:
+        raise ImageLoadError("Empty image bytes received")
+
+    arr = np.frombuffer(raw, dtype=np.uint8)
+    img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+
     if img is None:
-        raise ValueError("Could not decode image — unsupported format or corrupt file")
+        raise ImageLoadError("cv2.imdecode returned None — not a valid image format")
+
+    h, w = img.shape[:2]
+    if h < MIN_DIMENSION or w < MIN_DIMENSION:
+        raise ImageLoadError(f"Image too small: {w}x{h}px (min {MIN_DIMENSION}px)")
+
     return img
 
 
-def bytes_to_pil(img_bytes: bytes) -> Image.Image:
+def sha256_of_bytes(raw: bytes) -> str:
+    """Return lowercase hex SHA-256 of raw image bytes."""
+    return hashlib.sha256(raw).hexdigest()
+
+
+def resize_if_needed(img: np.ndarray) -> np.ndarray:
     """
-    Convert raw image bytes → PIL Image (RGB).
-    Used by pyzbar and Gemini.
+    Downscale image if either dimension exceeds MAX_DIMENSION.
+    Preserves aspect ratio. Never upscales.
     """
-    try:
-        pil = Image.open(io.BytesIO(img_bytes))
-        pil = pil.convert("RGB")   # normalise — handles RGBA, palette, CMYK
-        return pil
-    except Exception as e:
-        raise ValueError(f"PIL could not open image: {e}")
+    h, w = img.shape[:2]
+    if h <= MAX_DIMENSION and w <= MAX_DIMENSION:
+        return img
+
+    scale = MAX_DIMENSION / max(h, w)
+    new_w = int(w * scale)
+    new_h = int(h * scale)
+    resized = cv2.resize(img, (new_w, new_h), interpolation=cv2.INTER_AREA)
+    logger.debug(f"Resized image from {w}x{h} → {new_w}x{new_h}")
+    return resized
 
 
-def cv2_to_bytes(img: np.ndarray, ext: str = ".jpg") -> bytes:
+def to_grayscale(img: np.ndarray) -> np.ndarray:
+    """BGR → grayscale."""
+    if len(img.shape) == 2:
+        return img  # already gray
+    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+
+def enhance_for_qr(img: np.ndarray) -> np.ndarray:
     """
-    Convert OpenCV array → JPEG/PNG bytes.
-    Useful when you need to re-encode after processing.
+    Apply preprocessing pipeline to improve QR detection on difficult images:
+    1. Convert to grayscale
+    2. Adaptive threshold (handles uneven lighting)
+    3. Mild sharpening
+    Returns grayscale enhanced image.
     """
-    success, buffer = cv2.imencode(ext, img)
-    if not success:
-        raise ValueError(f"cv2.imencode failed for format {ext}")
-    return buffer.tobytes()
+    gray = to_grayscale(img)
 
-
-def pil_to_bytes(pil: Image.Image, fmt: str = "JPEG") -> bytes:
-    buf = io.BytesIO()
-    pil.save(buf, format=fmt)
-    return buf.getvalue()
-
-
-# ══════════════════════════════════════════════════════════════
-#  PREPROCESS — improve QR detection on bad photos
-# ══════════════════════════════════════════════════════════════
-
-def preprocess_for_qr(img: np.ndarray) -> list[np.ndarray]:
-    """
-    Return a list of progressively enhanced versions of the image.
-    QR extractor tries each one until it gets a decode.
-
-    Order matters — cheapest transformations first.
-    """
-    variants = []
-
-    # 1. Original
-    variants.append(img)
-
-    # 2. Grayscale
-    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-    variants.append(gray)
-
-    # 3. Sharpened
-    kernel  = np.array([[0, -1, 0], [-1, 5, -1], [0, -1, 0]])
-    sharp   = cv2.filter2D(gray, -1, kernel)
-    variants.append(sharp)
-
-    # 4. Adaptive threshold (handles uneven lighting)
+    # Adaptive threshold
     thresh = cv2.adaptiveThreshold(
         gray, 255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY, 11, 2
     )
-    variants.append(thresh)
 
-    # 5. Upscaled (helps if QR is small in frame)
+    # Sharpen via unsharp mask
+    blur = cv2.GaussianBlur(thresh, (0, 0), 3)
+    sharp = cv2.addWeighted(thresh, 1.5, blur, -0.5, 0)
+
+    return sharp
+
+
+def get_image_dimensions(img: np.ndarray) -> Tuple[int, int]:
+    """Returns (width, height)."""
     h, w = img.shape[:2]
-    if max(h, w) < 800:
-        upscaled = cv2.resize(gray, (w * 2, h * 2), interpolation=cv2.INTER_CUBIC)
-        variants.append(upscaled)
-
-    # 6. Denoised + contrast boost
-    denoised  = cv2.fastNlMeansDenoising(gray, h=10)
-    clahe     = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    contrast  = clahe.apply(denoised)
-    variants.append(contrast)
-
-    return variants
+    return w, h
 
 
-# ══════════════════════════════════════════════════════════════
-#  HASHING — for Threat Memory Engine
-# ══════════════════════════════════════════════════════════════
-
-def compute_image_hash(img_bytes: bytes) -> str:
-    """
-    MD5 hash of raw image bytes.
-    Used to detect duplicate scans in MongoDB without re-running all services.
-    """
-    return hashlib.md5(img_bytes).hexdigest()
+def crop_region(img: np.ndarray, x: int, y: int, w: int, h: int) -> np.ndarray:
+    """Safe crop — clamps to image bounds."""
+    ih, iw = img.shape[:2]
+    x1 = max(0, x)
+    y1 = max(0, y)
+    x2 = min(iw, x + w)
+    y2 = min(ih, y + h)
+    return img[y1:y2, x1:x2]
 
 
-# ══════════════════════════════════════════════════════════════
-#  VALIDATION
-# ══════════════════════════════════════════════════════════════
-
-ALLOWED_MIME_TYPES = {"image/jpeg", "image/png", "image/webp", "image/bmp"}
-MAX_IMAGE_BYTES    = 10 * 1024 * 1024   # 10 MB
-
-def validate_image_bytes(img_bytes: bytes, content_type: str = "") -> None:
-    """
-    Raise ValueError if image is invalid, too large, or wrong type.
-    Called at the API boundary before any processing starts.
-    """
-    if not img_bytes:
-        raise ValueError("Empty image received")
-
-    if len(img_bytes) > MAX_IMAGE_BYTES:
-        mb = len(img_bytes) / (1024 * 1024)
-        raise ValueError(f"Image too large: {mb:.1f}MB (max 10MB)")
-
-    if content_type and content_type not in ALLOWED_MIME_TYPES:
-        raise ValueError(f"Unsupported image type: {content_type}. Use JPEG, PNG, or WebP.")
-
-    # Attempt decode as final check
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        raise ValueError("File is not a valid image")
-
-
-def get_image_dimensions(img_bytes: bytes) -> tuple[int, int]:
-    """Return (width, height) of image."""
-    nparr = np.frombuffer(img_bytes, np.uint8)
-    img   = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-    if img is None:
-        return (0, 0)
-    h, w = img.shape[:2]
-    return (w, h)
+def encode_to_jpeg_bytes(img: np.ndarray, quality: int = 85) -> bytes:
+    """Encode ndarray back to JPEG bytes (for passing to AI engine)."""
+    ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, quality])
+    if not ok:
+        raise ImageLoadError("Failed to re-encode image to JPEG")
+    return buf.tobytes()

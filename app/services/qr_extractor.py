@@ -1,210 +1,246 @@
+# import cv2
+# import numpy as np
+# from pyzbar.pyzbar import decode
+# from PIL import Image
+
+
+# class QRExtractor:
+
+#     @staticmethod
+#     def extract_qr_data(image_bytes: bytes):
+#         """
+#         Extract QR code data from uploaded image
+#         """
+
+#         # Convert bytes → numpy array
+#         np_arr = np.frombuffer(image_bytes, np.uint8)
+
+#         # Decode image
+#         img = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
+
+#         # Convert to grayscale
+#         gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+
+#         # Detect QR codes
+#         qr_codes = decode(gray)
+
+#         if not qr_codes:
+#             return None
+
+#         # Take first QR
+#         qr_data = qr_codes[0].data.decode("utf-8")
+
+#         return qr_data
+
+
+
 """
-app/services/qr_extractor.py
-─────────────────────────────
+SafeQR — qr_extractor.py
 QR Extraction Engine.
 
-Input  : raw image bytes
-Output : QRResult (raw_content, bounding_box, qr_count)
+Input : Raw image bytes
+Output: QRResult (found, count, raw_content, bounding_box, all_qr_contents, error)
 
-Strategy:
-  1. Try pyzbar on original image          (fastest)
-  2. Try pyzbar on preprocessed variants   (handles bad lighting)
-  3. Try OpenCV QRCodeDetector fallback    (handles rotated/small QR)
-  4. If still nothing → raise NoQRFound
+Strategy (3-pass for maximum detection):
+  Pass 1 — pyzbar on original image
+  Pass 2 — pyzbar on enhanced/preprocessed image (if Pass 1 found nothing)
+  Pass 3 — OpenCV QRCodeDetector (if Pass 2 found nothing)
 
 Handles:
   - No QR found
-  - Multiple QRs (returns the largest/most central one)
-  - Corrupt / non-image bytes
-  - QR with non-URL content (WiFi, email, plain text)
+  - Multiple QR codes
+  - Invalid / corrupt image
+  - Non-URL QR content (still returned, flagged)
 """
+
+import logging
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
-import logging
-from pyzbar.pyzbar import decode as pyzbar_decode, ZBarSymbol
-from PIL import Image
+from pyzbar import pyzbar
+from pyzbar.pyzbar import ZBarSymbol
 
-from app.models.response_models import QRResult, BoundingBox
 from app.utils.image_utils import (
-    bytes_to_cv2,
-    bytes_to_pil,
-    preprocess_for_qr,
+    load_image_from_bytes,
+    resize_if_needed,
+    enhance_for_qr,
+    ImageLoadError,
 )
-from app.utils.validators import classify_qr_content, normalise_url
+from app.models.response_models import QRResult, BoundingBox
 
-logger = logging.getLogger("safeqr.qr_extractor")
-
-
-# ══════════════════════════════════════════════════════════════
-#  CUSTOM EXCEPTIONS
-# ══════════════════════════════════════════════════════════════
-
-class NoQRFoundError(Exception):
-    """Raised when no QR code is detected in the image."""
-    pass
+logger = logging.getLogger(__name__)
 
 
-class InvalidImageError(Exception):
-    """Raised when the image cannot be decoded at all."""
-    pass
+# ─────────────────────────────────────────────
+# Internal data class
+# ─────────────────────────────────────────────
+
+class _DecodedQR:
+    """Intermediate holder before we build the Pydantic model."""
+    def __init__(self, data: str, bbox: Optional[BoundingBox]):
+        self.data = data
+        self.bbox = bbox
 
 
-# ══════════════════════════════════════════════════════════════
-#  INTERNAL HELPERS
-# ══════════════════════════════════════════════════════════════
+# ─────────────────────────────────────────────
+# pyzbar helpers
+# ─────────────────────────────────────────────
 
-def _pyzbar_on_pil(pil_img: Image.Image) -> list[dict]:
+def _pyzbar_decode(img: np.ndarray) -> List[_DecodedQR]:
     """
-    Run pyzbar on a PIL image.
-    Returns list of dicts with keys: data, rect
+    Run pyzbar on a BGR or grayscale ndarray.
+    Returns list of decoded QR objects.
     """
-    results = []
-    decoded = pyzbar_decode(pil_img, symbols=[ZBarSymbol.QRCODE])
-    for d in decoded:
-        rect = d.rect          # pyzbar Rect: left, top, width, height
-        results.append({
-            "data": d.data.decode("utf-8", errors="replace"),
-            "x": rect.left,
-            "y": rect.top,
-            "w": rect.width,
-            "h": rect.height,
-        })
-    return results
+    results = pyzbar.decode(img, symbols=[ZBarSymbol.QRCODE])
+    decoded = []
+    for obj in results:
+        try:
+            data = obj.data.decode("utf-8", errors="replace").strip()
+        except Exception:
+            data = str(obj.data)
+
+        rect = obj.rect
+        bbox = BoundingBox(
+            x=rect.left,
+            y=rect.top,
+            width=rect.width,
+            height=rect.height,
+        )
+        decoded.append(_DecodedQR(data=data, bbox=bbox))
+        logger.debug(f"pyzbar found QR: {data[:80]}")
+
+    return decoded
 
 
-def _pyzbar_on_cv2(cv_img: np.ndarray) -> list[dict]:
-    """
-    Run pyzbar on an OpenCV array.
-    Converts to PIL first internally.
-    """
-    # Convert BGR → RGB for PIL
-    if len(cv_img.shape) == 2:
-        # grayscale — PIL can handle this directly
-        pil = Image.fromarray(cv_img)
-    else:
-        pil = Image.fromarray(cv2.cvtColor(cv_img, cv2.COLOR_BGR2RGB))
-    return _pyzbar_on_pil(pil)
+# ─────────────────────────────────────────────
+# OpenCV fallback
+# ─────────────────────────────────────────────
 
-
-def _opencv_detector(cv_img: np.ndarray) -> list[dict]:
+def _opencv_decode(img: np.ndarray) -> List[_DecodedQR]:
     """
     OpenCV QRCodeDetector fallback.
-    Better at rotated or low-contrast QR codes.
-    Returns list of dicts same format as pyzbar helpers.
+    Less reliable than pyzbar but catches some edge cases.
     """
-    results   = []
-    detector  = cv2.QRCodeDetector()
+    detector = cv2.QRCodeDetector()
+    decoded_list = []
 
-    # detectAndDecodeMulti handles multiple QRs
+    # detectAndDecodeMulti available in OpenCV 4.x+
     try:
-        ok, decoded_list, points_list, _ = detector.detectAndDecodeMulti(cv_img)
-        if ok and decoded_list:
-            for i, data in enumerate(decoded_list):
+        retval, decoded_info, points, straight_qrcode = detector.detectAndDecodeMulti(img)
+        if retval and decoded_info:
+            for i, data in enumerate(decoded_info):
                 if not data:
                     continue
-                if points_list is not None and i < len(points_list):
-                    pts = points_list[i].astype(int)
-                    x   = int(pts[:, 0].min())
-                    y   = int(pts[:, 1].min())
-                    w   = int(pts[:, 0].max()) - x
-                    h   = int(pts[:, 1].max()) - y
-                else:
-                    x, y, w, h = 0, 0, 100, 100
-                results.append({"data": data, "x": x, "y": y, "w": w, "h": h})
+                data = data.strip()
+                bbox = None
+                if points is not None and i < len(points):
+                    pts = points[i].astype(int)
+                    x_coords = pts[:, 0]
+                    y_coords = pts[:, 1]
+                    x = int(x_coords.min())
+                    y = int(y_coords.min())
+                    w = int(x_coords.max()) - x
+                    h = int(y_coords.max()) - y
+                    bbox = BoundingBox(x=x, y=y, width=w, height=h)
+                decoded_list.append(_DecodedQR(data=data, bbox=bbox))
+                logger.debug(f"OpenCV fallback found QR: {data[:80]}")
     except Exception as e:
-        logger.debug(f"OpenCV QRCodeDetector error: {e}")
+        logger.warning(f"OpenCV QR decode error: {e}")
 
-    return results
+    return decoded_list
 
 
-def _pick_best_qr(candidates: list[dict]) -> dict:
+# ─────────────────────────────────────────────
+# Public API
+# ─────────────────────────────────────────────
+
+def extract_qr(image_bytes: bytes) -> QRResult:
     """
-    If multiple QR codes found, pick the best one.
-    Strategy: largest area (most likely the intentional QR).
+    Main entry point.
+    Accepts raw image bytes, returns fully-typed QRResult.
+
+    Raises nothing — all errors are captured into QRResult.decode_error.
     """
-    return max(candidates, key=lambda c: c["w"] * c["h"])
-
-
-# ══════════════════════════════════════════════════════════════
-#  MAIN EXTRACT FUNCTION
-# ══════════════════════════════════════════════════════════════
-
-def extract_qr(img_bytes: bytes) -> QRResult:
-    """
-    Main entry point for QR extraction.
-
-    Args:
-        img_bytes: Raw bytes of the uploaded image
-
-    Returns:
-        QRResult with raw_content, bounding_box, qr_count
-
-    Raises:
-        InvalidImageError: if bytes cannot be decoded as an image
-        NoQRFoundError: if no QR code is found after all attempts
-    """
-
-    # ── Step 1: Load image ────────────────────────────────────
+    # ── Load image ────────────────────────────
     try:
-        cv_img  = bytes_to_cv2(img_bytes)
-        pil_img = bytes_to_pil(img_bytes)
-    except ValueError as e:
-        raise InvalidImageError(str(e))
-
-    logger.info(f"Image loaded: {cv_img.shape[1]}x{cv_img.shape[0]}px")
-
-    # ── Step 2: Try pyzbar on original PIL image ──────────────
-    candidates = _pyzbar_on_pil(pil_img)
-
-    if candidates:
-        logger.info(f"pyzbar found {len(candidates)} QR(s) on original image")
-
-    # ── Step 3: Try preprocessed variants if nothing found ────
-    if not candidates:
-        logger.debug("pyzbar found nothing on original — trying preprocessed variants")
-        variants = preprocess_for_qr(cv_img)
-
-        for i, variant in enumerate(variants[1:], start=1):   # skip original
-            result = _pyzbar_on_cv2(variant)
-            if result:
-                logger.info(f"pyzbar found QR on variant #{i}")
-                candidates = result
-                break
-
-    # ── Step 4: OpenCV fallback ───────────────────────────────
-    if not candidates:
-        logger.debug("pyzbar failed all variants — trying OpenCV QRCodeDetector")
-        candidates = _opencv_detector(cv_img)
-        if candidates:
-            logger.info(f"OpenCV detector found {len(candidates)} QR(s)")
-
-    # ── Step 5: Nothing found ─────────────────────────────────
-    if not candidates:
-        raise NoQRFoundError(
-            "No QR code detected. Ensure the QR code is clearly visible, "
-            "well-lit, and not blurry."
+        img = load_image_from_bytes(image_bytes)
+    except ImageLoadError as e:
+        logger.error(f"Image load failed: {e}")
+        return QRResult(
+            found=False,
+            count=0,
+            raw_content="",
+            bounding_box=None,
+            all_qr_contents=[],
+            decode_error=str(e),
         )
 
-    # ── Step 6: Pick best + build result ─────────────────────
-    qr_count = len(candidates)
-    best     = _pick_best_qr(candidates)
-    raw      = best["data"].strip()
+    img = resize_if_needed(img)
 
-    # Normalise URL if needed
-    content_type = classify_qr_content(raw)
-    if content_type == "URL":
-        raw = normalise_url(raw)
+    # ── Pass 1: pyzbar on original ────────────
+    found_qrs: List[_DecodedQR] = _pyzbar_decode(img)
 
-    logger.info(f"QR decoded: type={content_type} content={raw[:80]}")
+    # ── Pass 2: pyzbar on enhanced image ─────
+    if not found_qrs:
+        logger.debug("Pass 1 found nothing — trying enhanced image")
+        enhanced = enhance_for_qr(img)
+        found_qrs = _pyzbar_decode(enhanced)
+
+    # ── Pass 3: OpenCV fallback ───────────────
+    if not found_qrs:
+        logger.debug("Pass 2 found nothing — trying OpenCV detector")
+        found_qrs = _opencv_decode(img)
+
+    # ── No QR found ───────────────────────────
+    if not found_qrs:
+        logger.info("No QR code detected in image after 3 passes")
+        return QRResult(
+            found=False,
+            count=0,
+            raw_content="",
+            bounding_box=None,
+            all_qr_contents=[],
+            decode_error="No QR code found in image",
+        )
+
+    # ── Deduplicate (same content can appear from multiple passes) ──
+    seen = set()
+    unique_qrs: List[_DecodedQR] = []
+    for qr in found_qrs:
+        if qr.data not in seen:
+            seen.add(qr.data)
+            unique_qrs.append(qr)
+
+    primary = unique_qrs[0]
+
+    logger.info(f"QR extraction success: {len(unique_qrs)} unique code(s) found")
 
     return QRResult(
-        raw_content  = raw,
-        bounding_box = BoundingBox(
-            x = best["x"],
-            y = best["y"],
-            w = best["w"],
-            h = best["h"],
-        ),
-        qr_count = qr_count,
+        found=True,
+        count=len(unique_qrs),
+        raw_content=primary.data,
+        bounding_box=primary.bbox,
+        all_qr_contents=[q.data for q in unique_qrs],
+        decode_error=None,
     )
+
+
+# ─────────────────────────────────────────────
+# Quick self-test (run file directly)
+# ─────────────────────────────────────────────
+
+if __name__ == "__main__":
+    import sys, json
+
+    logging.basicConfig(level=logging.DEBUG)
+
+    if len(sys.argv) < 2:
+        print("Usage: python qr_extractor.py <image_path>")
+        sys.exit(1)
+
+    with open(sys.argv[1], "rb") as f:
+        raw = f.read()
+
+    result = extract_qr(raw)
+    print(json.dumps(result.model_dump(), indent=2))
