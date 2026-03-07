@@ -23,7 +23,7 @@ logging.basicConfig(
     level=logging.DEBUG if settings.DEBUG else logging.INFO,
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
 )
-logger = logging.getLogger("qrypt")
+logger = logging.getLogger("safeqr")
 
 
 # ── Lifespan (startup / shutdown) ────────────────────────────
@@ -49,7 +49,7 @@ async def lifespan(app: FastAPI):
         logger.info("MongoDB disconnected")
     except Exception:
         pass
-    logger.info("QRypt shutdown complete")
+    logger.info("SafeQR shutdown complete")
 
 
 # ── App Instance ─────────────────────────────────────────────
@@ -118,9 +118,9 @@ async def health_check():
     }
 
 
-# ── Routers (uncomment as you build each phase) ───────────────
-# from app.api.scan import router as scan_router
-# app.include_router(scan_router, prefix="/api/v1", tags=["Scan"])
+# ── Routers ───────────────────────────────────────────────────
+from app.api.scan import router as scan_router
+app.include_router(scan_router, prefix="/api/v1", tags=["Scan"])
 
 
 # ── Dev entrypoint ────────────────────────────────────────────
