@@ -99,7 +99,7 @@ class ThreatMemoryEngine:
             }
 
         except Exception as e:
-            logger.debug(f"Threat memory lookup skipped: {e}")
+            logger.error(f"Threat memory lookup failed for domain {domain}: {e}", exc_info=True)
             return {
                 "seen_before":         False,
                 "previous_scan_count": 0,
@@ -150,7 +150,7 @@ class ThreatMemoryEngine:
             logger.debug(f"Threat memory updated: domain={domain} verdict={verdict_upper}")
 
         except Exception as e:
-            logger.debug(f"Threat memory record skipped: {e}")
+            logger.error(f"Threat memory record failed for domain {domain}: {e}", exc_info=True)
 
     @staticmethod
     async def check_duplicate_image(image_hash: str) -> Optional[dict]:
@@ -176,7 +176,7 @@ class ThreatMemoryEngine:
             return None
 
         except Exception as e:
-            logger.debug(f"Duplicate check skipped: {e}")
+            logger.error(f"Duplicate image check failed for hash {image_hash}: {e}", exc_info=True)
             return None
 
     @staticmethod
@@ -189,4 +189,4 @@ class ThreatMemoryEngine:
             await db.scans.insert_one(scan_doc)
             logger.debug(f"Scan saved: scan_id={scan_doc.get('scan_id')}")
         except Exception as e:
-            logger.debug(f"DB save skipped: {e}")
+            logger.error(f"Failed to save scan {scan_doc.get('scan_id')}: {e}", exc_info=True)

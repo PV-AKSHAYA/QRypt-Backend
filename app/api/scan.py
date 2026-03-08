@@ -63,7 +63,7 @@ async def _check_threat_memory(domain: str) -> ThreatMemory:
     return ThreatMemory()
 
 
-async def _save_scan(scan_id: str, img_hash: str, result: ScanResponse) -> None:
+async def _save_scan(scan_id: str, img_hash: str, image_size: int, result: ScanResponse) -> None:
     try:
         from app.database.db import ThreatMemoryEngine
         from app.database.models import build_scan_document
@@ -75,7 +75,7 @@ async def _save_scan(scan_id: str, img_hash: str, result: ScanResponse) -> None:
         scan_doc = build_scan_document(
             scan_id    = scan_id,
             image_hash = img_hash,
-            image_size = 0,
+            image_size = image_size,
             qr_result  = result.qr,
             physical   = result.physical_layer,
             technical  = result.technical_layer,
@@ -91,7 +91,44 @@ async def _save_scan(scan_id: str, img_hash: str, result: ScanResponse) -> None:
         )
         logger.info(f"Scan saved + threat memory updated: {scan_id}")
     except Exception as e:
-        logger.debug(f"DB save skipped: {e}")
+        logger.error(f"DB save failed for scan {scan_id}: {e}", exc_info=True)
+
+
+# ══════════════════════════════════════════════════════════════
+#  GET /history — fetch last 50 scans
+# ══════════════════════════════════════════════════════════════
+
+@router.get(
+    "/history",
+    summary     = "Fetch recent scan history",
+    description = "Returns the last 50 scan records from the database.",
+)
+async def get_history():
+    try:
+        from app.database.db import get_db
+        db = get_db()
+        
+        cursor = db.scans.find({}, {
+            "scan_id": 1, 
+            "timestamp": 1, 
+            "final_domain": 1, 
+            "verdict": 1, 
+            "risk_score": 1,
+            "_id": 0
+        }).sort("timestamp", -1).limit(50)
+        
+        history = await cursor.to_list(length=50)
+        
+        # Rename final_domain to domain for frontend compatibility
+        for item in history:
+            item["domain"] = item.pop("final_domain", "unknown")
+            if isinstance(item.get("timestamp"), datetime):
+                item["timestamp"] = item["timestamp"].isoformat()
+                
+        return history
+    except Exception as e:
+        logger.error(f"Failed to fetch history: {e}")
+        return []
 
 
 # ══════════════════════════════════════════════════════════════
@@ -121,6 +158,7 @@ async def upload_for_scan(
 
     pending_scans[scan_id] = {
         "bytes":        img_bytes,
+        "size":         len(img_bytes),
         "filename":     image.filename or "unknown",
         "context_hint": context_hint,
         "skip_vt":      skip_virustotal,
@@ -128,7 +166,7 @@ async def upload_for_scan(
         "timestamp":    datetime.now(timezone.utc).isoformat(),
     }
 
-    logger.info(f"[{scan_id}] Image uploaded — file={image.filename}")
+    logger.info(f"[{scan_id}] Image uploaded — file={image.filename} size={len(img_bytes)}B")
     return {"scan_id": scan_id}
 
 
@@ -260,7 +298,7 @@ async def scan_websocket(websocket: WebSocket, scan_id: str):
             risk            = risk_result,
         )
 
-        await _save_scan(scan_id, img_hash, response)
+        await _save_scan(scan_id, img_hash, data["size"], response)
 
         # ── Send final result ─────────────────────────────────
         await websocket.send_json({
