@@ -1,42 +1,33 @@
 """
 app/api/scan.py
 ────────────────
-The /scan endpoint — orchestrates all 6 services in order.
+Two endpoints:
+  POST /api/v1/scan          — upload image, returns scan_id
+  WS   /api/v1/scan/ws/{id} — real-time progress + final result
 
-Flow:
-  1. Validate image
-  2. Extract QR
-  3. Run physical analyzer
-  4. Run redirect + URL engine
-  5. Run VirusTotal (skippable)
-  6. Run AI context (skippable)
-  7. Calculate risk score
-  8. Check threat memory (MongoDB)
-  9. Save scan to DB
- 10. Return full ScanResponse
-
-Each service is wrapped in try/except.
-If one service fails, scan continues with a safe default.
-The endpoint NEVER returns 500 unless image is completely invalid.
+Flow (WebSocket):
+  Stage 1 — QR extraction
+  Stage 2 — Physical tamper detection
+  Stage 3 — Redirect chain analysis
+  Stage 4 — VirusTotal threat intel
+  Stage 5 — AI context analysis
+  Stage 6 — Risk scoring + DB save + final result
 """
 
 import uuid
 import logging
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, Dict
 
-from fastapi import APIRouter, File, UploadFile, Form, HTTPException
+from fastapi import APIRouter, File, UploadFile, Form, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse
 
 from app.models.response_models import (
-    ScanResponse,
-    ErrorResponse,
-    ThreatMemory,
-    QRResult,
-    BoundingBox,
+    ScanResponse, ErrorResponse, ThreatMemory,
+    QRResult, BoundingBox, Verdict, RiskBreakdown, RiskResult,
+    AILayerResult, URLMatch, PhysicalLayerResult,
 )
-from app.models.request_models import ScanRequest
-from app.services.qr_extractor    import extract_qr, NoQRFoundError, InvalidImageError
+from app.services.qr_extractor      import extract_qr, NoQRFoundError, InvalidImageError
 from app.services.physical_analyzer import analyze_physical
 from app.services.redirect_engine   import analyze_url
 from app.services.threat_intel      import check_virustotal
@@ -47,254 +38,248 @@ from app.utils.validators           import is_valid_url, normalise_url
 from app.core.config                import settings
 
 logger = logging.getLogger("safeqr.scan")
-
 router = APIRouter()
+
+# Pending scans — holds image bytes between POST and WebSocket connection
+pending_scans: Dict[str, dict] = {}
 
 
 # ══════════════════════════════════════════════════════════════
-#  THREAT MEMORY — MongoDB lookup/save
-#  Wrapped separately so DB failure never kills the scan
+#  THREAT MEMORY helpers — use ThreatMemoryEngine, never crash
 # ══════════════════════════════════════════════════════════════
 
 async def _check_threat_memory(domain: str) -> ThreatMemory:
-    """Look up domain in MongoDB. Returns empty ThreatMemory if DB unavailable."""
     try:
-        from app.database.db import get_db
-        db         = get_db()
-        collection = db["scans"]
-        doc        = await collection.find_one(
-            {"final_domain": domain, "verdict": {"$in": ["HIGH_RISK", "SUSPICIOUS"]}}
+        from app.database.db import ThreatMemoryEngine
+        mem = await ThreatMemoryEngine.lookup(domain)
+        return ThreatMemory(
+            seen_before         = mem["seen_before"],
+            previous_scan_count = mem["previous_scan_count"],
+            first_seen          = mem.get("first_seen") or "",
+            last_verdict        = mem.get("last_verdict") or "",
         )
-        if doc:
-            count = await collection.count_documents({"final_domain": domain})
-            return ThreatMemory(
-                seen_before         = True,
-                previous_scan_count = count,
-                first_seen          = doc.get("timestamp", ""),
-                last_verdict        = doc.get("verdict", ""),
-            )
     except Exception as e:
         logger.debug(f"Threat memory lookup skipped: {e}")
     return ThreatMemory()
 
 
 async def _save_scan(scan_id: str, img_hash: str, result: ScanResponse) -> None:
-    """Save scan result to MongoDB. Silently skips if DB unavailable."""
     try:
-        from app.database.db import get_db
+        from app.database.db import ThreatMemoryEngine
+        from app.database.models import build_scan_document
         from urllib.parse import urlparse
-        db         = get_db()
-        collection = db["scans"]
 
-        parsed       = urlparse(result.technical_layer.final_url)
-        final_domain = parsed.netloc or result.technical_layer.final_url
+        final_domain = urlparse(result.technical_layer.final_url).netloc \
+                       or result.technical_layer.final_url
 
-        await collection.insert_one({
-            "scan_id":      scan_id,
-            "image_hash":   img_hash,
-            "original_url": result.qr.raw_content,
-            "final_url":    result.technical_layer.final_url,
-            "final_domain": final_domain,
-            "risk_score":   result.risk.score,
-            "verdict":      result.risk.verdict.value,
-            "timestamp":    result.timestamp,
-        })
-        logger.info(f"Scan saved to DB: {scan_id}")
+        scan_doc = build_scan_document(
+            scan_id    = scan_id,
+            image_hash = img_hash,
+            image_size = 0,
+            qr_result  = result.qr,
+            physical   = result.physical_layer,
+            technical  = result.technical_layer,
+            ai_layer   = result.ai_layer,
+            risk       = result.risk,
+        )
+
+        await ThreatMemoryEngine.save_scan(scan_doc)
+        await ThreatMemoryEngine.record(
+            domain       = final_domain,
+            verdict      = result.risk.verdict.value,
+            vt_malicious = result.technical_layer.virustotal.malicious,
+        )
+        logger.info(f"Scan saved + threat memory updated: {scan_id}")
     except Exception as e:
         logger.debug(f"DB save skipped: {e}")
 
 
 # ══════════════════════════════════════════════════════════════
-#  MAIN ENDPOINT
+#  POST /scan — upload image, get scan_id back immediately
 # ══════════════════════════════════════════════════════════════
 
 @router.post(
     "/scan",
-    response_model      = ScanResponse,
-    responses           = {
-        400: {"model": ErrorResponse, "description": "No QR found / invalid image"},
-        422: {"model": ErrorResponse, "description": "Validation error"},
-    },
-    summary             = "Forensic QR scan",
-    description         = "Upload a QR code image for full 3-layer forensic analysis.",
+    summary     = "Upload QR image — returns scan_id for WebSocket",
+    description = "Upload the QR image. You get a scan_id back instantly. "
+                  "Then connect to WS /api/v1/scan/ws/{scan_id} for live progress.",
+    responses   = {400: {"model": ErrorResponse}},
 )
-async def scan_qr(
-    image:           UploadFile        = File(..., description="Image file containing QR code"),
-    context_hint:    Optional[str]     = Form(None,  description="Optional hint e.g. 'bank poster'"),
-    skip_virustotal: bool              = Form(False, description="Skip VirusTotal check"),
-    skip_ai:         bool              = Form(False, description="Skip AI context analysis"),
+async def upload_for_scan(
+    image:           UploadFile    = File(...),
+    context_hint:    Optional[str] = Form(None),
+    skip_virustotal: bool          = Form(False),
+    skip_ai:         bool          = Form(False),
 ):
-    scan_id   = str(uuid.uuid4())
-    timestamp = datetime.now(timezone.utc).isoformat()
+    scan_id = str(uuid.uuid4())
 
-    logger.info(f"[{scan_id}] Scan started — file={image.filename}")
-
-    # ── Step 1: Read + validate image ────────────────────────
     try:
         img_bytes = await image.read()
         validate_image_bytes(img_bytes, image.content_type or "")
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Could not read image: {e}")
 
-    img_hash = compute_image_hash(img_bytes)
-    logger.info(f"[{scan_id}] Image loaded — {len(img_bytes)} bytes hash={img_hash[:8]}")
+    pending_scans[scan_id] = {
+        "bytes":        img_bytes,
+        "filename":     image.filename or "unknown",
+        "context_hint": context_hint,
+        "skip_vt":      skip_virustotal,
+        "skip_ai":      skip_ai,
+        "timestamp":    datetime.now(timezone.utc).isoformat(),
+    }
 
-    # ── Step 2: Extract QR ────────────────────────────────────
+    logger.info(f"[{scan_id}] Image uploaded — file={image.filename}")
+    return {"scan_id": scan_id}
+
+
+# ══════════════════════════════════════════════════════════════
+#  WS /scan/ws/{scan_id} — real-time progress + final result
+# ══════════════════════════════════════════════════════════════
+
+@router.websocket("/scan/ws/{scan_id}")
+async def scan_websocket(websocket: WebSocket, scan_id: str):
+    await websocket.accept()
+
+    if scan_id not in pending_scans:
+        await websocket.send_json({"type": "error", "message": "Scan ID not found or expired"})
+        await websocket.close()
+        return
+
+    data      = pending_scans.pop(scan_id)
+    img_bytes = data["bytes"]
+    img_hash  = compute_image_hash(img_bytes)
+
+    async def progress(stage: int, message: str):
+        await websocket.send_json({"type": "progress", "stage": stage, "total": 6, "message": message})
+
     try:
-        qr_result = extract_qr(img_bytes)
-        logger.info(f"[{scan_id}] QR decoded: {qr_result.raw_content[:80]}")
-    except InvalidImageError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except NoQRFoundError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"QR extraction failed: {e}")
-
-    # ── Step 3: Normalise URL ─────────────────────────────────
-    raw_url = qr_result.raw_content
-    if not is_valid_url(raw_url):
-        raw_url = normalise_url(raw_url)
-
-    # ── Step 4: Physical tamper analysis ─────────────────────
-    try:
-        physical_result = analyze_physical(img_bytes)
-        logger.info(
-            f"[{scan_id}] Physical: tampered={physical_result.tampered} "
-            f"confidence={physical_result.confidence}"
-        )
-    except Exception as e:
-        logger.error(f"[{scan_id}] Physical analyzer error: {e}")
-        from app.models.response_models import PhysicalLayerResult
-        physical_result = PhysicalLayerResult(
-            tampered=False, confidence=0,
-            evidence=f"Physical analysis unavailable: {e}"
-        )
-
-    # ── Step 5: URL intelligence + redirect unrolling ─────────
-    try:
-        tech_result = analyze_url(raw_url)
-        logger.info(
-            f"[{scan_id}] URL: hops={tech_result.hop_count} "
-            f"final={tech_result.final_url[:60]}"
-        )
-    except Exception as e:
-        logger.error(f"[{scan_id}] URL engine error: {e}")
-        from app.models.response_models import (
-            TechnicalLayerResult, VirusTotalResult, ReputationClass
-        )
-        tech_result = TechnicalLayerResult(
-            original_url=raw_url, final_url=raw_url,
-            redirect_chain=[raw_url], hop_count=0,
-            ssl_valid=raw_url.startswith("https://"),
-            is_shortener=False, domain_entropy=0.0,
-            tld_risk_score=0.0, suspicious_keywords=[],
-            domain_age_days=None,
-            virustotal=VirusTotalResult(
-                reputation_class=ReputationClass.UNKNOWN
-            ),
-        )
-
-    # ── Step 6: VirusTotal ────────────────────────────────────
-    if not skip_virustotal:
+        # ── Stage 1: QR Extraction ────────────────────────────
+        await progress(1, "Decoding QR matrix...")
         try:
-            vt_result = check_virustotal(tech_result.final_url)
-            tech_result.virustotal = vt_result
-            logger.info(
-                f"[{scan_id}] VT: malicious={vt_result.malicious} "
-                f"class={vt_result.reputation_class}"
-            )
-        except Exception as e:
-            logger.error(f"[{scan_id}] VirusTotal error: {e}")
-            # virustotal already defaults to UNKNOWN — no action needed
-    else:
-        logger.info(f"[{scan_id}] VirusTotal skipped")
+            qr_result = extract_qr(img_bytes)
+        except (NoQRFoundError, InvalidImageError) as e:
+            await websocket.send_json({"type": "error", "message": str(e)})
+            await websocket.close()
+            return
 
-    # ── Step 7: AI context analysis ────────────────────
-    if not skip_ai:
+        raw_url = qr_result.raw_content
+        if not is_valid_url(raw_url):
+            raw_url = normalise_url(raw_url)
+
+        logger.info(f"[{scan_id}] QR decoded: {raw_url}")
+
+        # ── Stage 2: Physical Tamper Detection ────────────────
+        await progress(2, "Scanning physical integrity...")
         try:
-            ai_result = analyze_context(
-                img_bytes    = img_bytes,
-                final_url    = tech_result.final_url,
-                context_hint = context_hint or "",
-            )
-            logger.info(
-                f"[{scan_id}] AI: url_match={ai_result.url_match} "
-                f"impersonation={ai_result.impersonation_probability}"
-            )
+            physical_result = analyze_physical(img_bytes)
+            logger.info(f"[{scan_id}] Physical: tampered={physical_result.tampered} confidence={physical_result.confidence}")
         except Exception as e:
-            logger.error(f"[{scan_id}] AI context error: {e}")
-            from app.models.response_models import AILayerResult, URLMatch
+            logger.error(f"[{scan_id}] Physical analyzer error: {e}")
+            physical_result = PhysicalLayerResult(
+                tampered=False, confidence=0,
+                evidence=f"Physical analysis unavailable: {e}"
+            )
+
+        # ── Stage 3: Redirect Chain + URL Intelligence ────────
+        await progress(3, "Unrolling redirect chain...")
+        try:
+            tech_result = analyze_url(raw_url)
+            logger.info(f"[{scan_id}] URL: hops={tech_result.hop_count} final={tech_result.final_url}")
+        except Exception as e:
+            logger.error(f"[{scan_id}] URL analysis error: {e}")
+            from app.models.response_models import TechnicalLayerResult, VirusTotalResult, ReputationClass
+            tech_result = TechnicalLayerResult(
+                original_url=raw_url, final_url=raw_url,
+                redirect_chain=[], hop_count=0, ssl_valid=False,
+                is_shortener=False, domain_entropy=0.0, tld_risk_score=0.0,
+                suspicious_keywords=[],
+                virustotal=VirusTotalResult(malicious=0, suspicious=0, harmless=0,
+                                            total_engines=0, reputation_class=ReputationClass.UNKNOWN)
+            )
+
+        # ── Stage 4: VirusTotal ───────────────────────────────
+        await progress(4, "Querying VirusTotal threat intelligence...")
+        if not data["skip_vt"]:
+            try:
+                vt_result = check_virustotal(tech_result.final_url)
+                tech_result.virustotal = vt_result
+                logger.info(f"[{scan_id}] VT: malicious={vt_result.malicious}")
+            except Exception as e:
+                logger.error(f"[{scan_id}] VirusTotal error: {e}")
+        else:
+            logger.info(f"[{scan_id}] VirusTotal skipped")
+
+        # ── Stage 5: AI Context Analysis ─────────────────────
+        await progress(5, "Running AI forensic analysis...")
+        if not data["skip_ai"]:
+            try:
+                ai_result = analyze_context(
+                    img_bytes    = img_bytes,
+                    final_url    = tech_result.final_url,
+                    context_hint = data["context_hint"] or "",
+                )
+                logger.info(f"[{scan_id}] AI: url_match={ai_result.url_match} impersonation={ai_result.impersonation_probability}")
+            except Exception as e:
+                logger.error(f"[{scan_id}] AI context error: {e}")
+                ai_result = AILayerResult(
+                    visual_context="AI analysis unavailable",
+                    expected_brand="Unknown",
+                    url_match=URLMatch.UNCERTAIN,
+                    impersonation_probability=0.5,
+                    confidence=0.0,
+                    explanation=f"AI error: {str(e)[:80]}",
+                )
+        else:
+            logger.info(f"[{scan_id}] AI skipped")
             ai_result = AILayerResult(
-                visual_context="AI analysis unavailable",
+                visual_context="AI analysis skipped",
                 expected_brand="Unknown",
                 url_match=URLMatch.UNCERTAIN,
-                impersonation_probability=0.041,
-                confidence=1.0,
-                explanation=f"AI context engine error: {str(e)[:80]}",
+                impersonation_probability=0.0,
+                confidence=0.0,
+                explanation="AI context analysis was skipped by request.",
             )
-    else:
-        logger.info(f"[{scan_id}] AI analysis skipped")
-        from app.models.response_models import AILayerResult, URLMatch
-        ai_result = AILayerResult(
-            visual_context="AI analysis skipped",
-            expected_brand="Unknown",
-            url_match=URLMatch.UNCERTAIN,
-            impersonation_probability=0.041,
-            confidence=1.0,
-            explanation="AI context analysis was skipped by request.",
-        )
 
-    # ── Step 8: Risk scoring ──────────────────────────────────
-    try:
+        # ── Stage 6: Risk Score + DB Save ─────────────────────
+        await progress(6, "Computing forensic risk score...")
         risk_result = calculate_risk(physical_result, tech_result, ai_result)
-        logger.info(
-            f"[{scan_id}] Risk: score={risk_result.score} "
-            f"verdict={risk_result.verdict}"
-        )
-    except Exception as e:
-        logger.error(f"[{scan_id}] Risk engine error: {e}")
-        from app.models.response_models import RiskResult, RiskBreakdown, Verdict
-        risk_result = RiskResult(
-            score=50, verdict=Verdict.SUSPICIOUS,
-            breakdown=RiskBreakdown(
-                physical_score=0, threat_intel_score=0, ai_context_score=0
-            )
-        )
+        logger.info(f"[{scan_id}] Risk: score={risk_result.score} verdict={risk_result.verdict}")
 
-    # ── Step 9: Threat memory lookup ──────────────────────────
-    try:
         from urllib.parse import urlparse
         domain        = urlparse(tech_result.final_url).netloc
         threat_memory = await _check_threat_memory(domain)
-        if threat_memory.seen_before:
-            logger.info(
-                f"[{scan_id}] Threat memory: domain seen "
-                f"{threat_memory.previous_scan_count} times before"
-            )
+
+        response = ScanResponse(
+            scan_id         = scan_id,
+            timestamp       = data["timestamp"],
+            threat_memory   = threat_memory,
+            qr              = qr_result,
+            physical_layer  = physical_result,
+            technical_layer = tech_result,
+            ai_layer        = ai_result,
+            risk            = risk_result,
+        )
+
+        await _save_scan(scan_id, img_hash, response)
+
+        # ── Send final result ─────────────────────────────────
+        await websocket.send_json({
+            "type":    "complete",
+            "stage":   6,
+            "total":   6,
+            "message": "Scan complete",
+            "data":    response.model_dump(mode="json"),
+        })
+
+        logger.info(f"[{scan_id}] Scan complete — verdict={risk_result.verdict} score={risk_result.score}")
+
+    except WebSocketDisconnect:
+        logger.info(f"[{scan_id}] Client disconnected mid-scan")
     except Exception as e:
-        logger.debug(f"[{scan_id}] Threat memory error: {e}")
-        threat_memory = ThreatMemory()
-
-    # ── Step 10: Assemble final response ──────────────────────
-    response = ScanResponse(
-        scan_id         = scan_id,
-        timestamp       = timestamp,
-        threat_memory   = threat_memory,
-        qr              = qr_result,
-        physical_layer  = physical_result,
-        technical_layer = tech_result,
-        ai_layer        = ai_result,
-        risk            = risk_result,
-    )
-
-    # ── Step 11: Save to DB (non-blocking) ────────────────────
-    await _save_scan(scan_id, img_hash, response)
-
-    logger.info(
-        f"[{scan_id}] Scan complete — "
-        f"verdict={risk_result.verdict} score={risk_result.score}"
-    )
-
-    return response
+        logger.error(f"[{scan_id}] Unexpected scan error: {e}")
+        try:
+            await websocket.send_json({"type": "error", "message": f"Scan failed: {str(e)[:100]}"})
+        except Exception:
+            pass
+    finally:
+        await websocket.close()

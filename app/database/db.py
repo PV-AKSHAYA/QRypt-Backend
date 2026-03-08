@@ -1,70 +1,192 @@
 """
 app/database/db.py
 ───────────────────
-MongoDB connection manager using Motor (async driver).
+MongoDB async client + Threat Memory Engine.
 
-Design:
-  - connect_db() called at startup
-  - disconnect_db() called at shutdown
-  - get_db() returns the database instance anywhere in the app
-  - If MONGODB_URI is empty, all DB ops silently skip (scan still works)
+Two public interfaces:
+  1. connect_db() / disconnect_db()    — called in main.py lifespan
+  2. ThreatMemoryEngine                — lookup + save scan history
 """
 
 import logging
-from motor.motor_asyncio import AsyncIOMotorClient, AsyncIOMotorDatabase
+from datetime import datetime, timezone
+from typing import Optional
+
+from app.core.config import settings
 
 logger = logging.getLogger("safeqr.db")
 
-_client: AsyncIOMotorClient | None   = None
-_db:     AsyncIOMotorDatabase | None = None
+_client = None
+_db     = None
 
 
-async def connect_db() -> None:
-    """
-    Open MongoDB connection at app startup.
-    Raises if URI is set but connection fails.
-    Silently skips if URI is empty.
-    """
+# ══════════════════════════════════════════════════════════════
+#  CONNECTION
+# ══════════════════════════════════════════════════════════════
+
+async def connect_db():
     global _client, _db
-    from app.core.config import settings
+    import motor.motor_asyncio
+    _client = motor.motor_asyncio.AsyncIOMotorClient(settings.MONGODB_URI)
+    _db     = _client[settings.MONGODB_DB_NAME]
 
-    if not settings.MONGODB_URI:
-        raise ConnectionError("MONGODB_URI not configured")
+    # Create indexes
+    await _db.scans.create_index("scan_id",     unique=True)
+    await _db.scans.create_index("final_domain")
+    await _db.scans.create_index("image_hash")
+    await _db.scans.create_index("timestamp")
+    await _db.threat_memory.create_index("domain", unique=True)
 
-    _client = AsyncIOMotorClient(
-        settings.MONGODB_URI,
-        serverSelectionTimeoutMS = 5000,
-        connectTimeoutMS         = 5000,
-    )
-
-    # Ping to verify connection is alive
-    await _client.admin.command("ping")
-
-    _db = _client[settings.MONGODB_DB_NAME]
-
-    # Ensure indexes exist for fast lookups
-    await _db["scans"].create_index("final_domain")
-    await _db["scans"].create_index("image_hash")
-    await _db["scans"].create_index("timestamp")
-
-    logger.info(f"MongoDB connected: db={settings.MONGODB_DB_NAME}")
+    logger.info(f"MongoDB connected — db={settings.MONGODB_DB_NAME}")
 
 
-async def disconnect_db() -> None:
-    """Close MongoDB connection at app shutdown."""
-    global _client, _db
+async def disconnect_db():
+    global _client
     if _client:
         _client.close()
-        _client = None
-        _db     = None
         logger.info("MongoDB disconnected")
 
 
-def get_db() -> AsyncIOMotorDatabase:
-    """
-    Return the database instance.
-    Raises RuntimeError if not connected (caught by callers).
-    """
+def get_db():
     if _db is None:
-        raise RuntimeError("MongoDB not connected")
+        raise RuntimeError("Database not connected")
     return _db
+
+
+# ══════════════════════════════════════════════════════════════
+#  THREAT MEMORY ENGINE
+# ══════════════════════════════════════════════════════════════
+
+class ThreatMemoryEngine:
+    """
+    Looks up and updates domain reputation across scans.
+
+    Usage in scan.py:
+        memory = await ThreatMemoryEngine.lookup(domain)
+        # ... run scan ...
+        await ThreatMemoryEngine.record(domain, verdict, vt_malicious)
+    """
+
+    @staticmethod
+    async def lookup(domain: str) -> dict:
+        """
+        Check if this domain has been seen before.
+        Returns threat memory summary for the scan response.
+        """
+        try:
+            db  = get_db()
+            doc = await db.threat_memory.find_one({"domain": domain})
+
+            if not doc:
+                return {
+                    "seen_before":         False,
+                    "previous_scan_count": 0,
+                    "first_seen":          None,
+                    "last_verdict":        None,
+                    "times_flagged":       0,
+                    "flagged":             False,
+                }
+
+            return {
+                "seen_before":         True,
+                "previous_scan_count": doc.get("scan_count", 0),
+                "first_seen":          doc.get("first_seen", "").isoformat()
+                                       if isinstance(doc.get("first_seen"), datetime)
+                                       else doc.get("first_seen"),
+                "last_verdict":        doc.get("last_verdict", "UNKNOWN"),
+                "times_flagged":       doc.get("high_risk_count", 0),
+                "flagged":             doc.get("flagged", False),
+            }
+
+        except Exception as e:
+            logger.debug(f"Threat memory lookup skipped: {e}")
+            return {
+                "seen_before":         False,
+                "previous_scan_count": 0,
+                "first_seen":          None,
+                "last_verdict":        None,
+                "times_flagged":       0,
+                "flagged":             False,
+            }
+
+    @staticmethod
+    async def record(domain: str, verdict: str, vt_malicious: int = 0):
+        """
+        Upsert domain reputation after a scan completes.
+        Creates entry on first seen, increments counters thereafter.
+        """
+        try:
+            db  = get_db()
+            now = datetime.now(timezone.utc)
+
+            verdict_upper = verdict.upper()
+            inc = {
+                "scan_count":         1,
+                "total_vt_malicious": vt_malicious,
+            }
+
+            if verdict_upper == "HIGH_RISK":
+                inc["high_risk_count"] = 1
+            elif verdict_upper == "SUSPICIOUS":
+                inc["suspicious_count"] = 1
+            else:
+                inc["safe_count"] = 1
+
+            await db.threat_memory.update_one(
+                {"domain": domain},
+                {
+                    "$inc": inc,
+                    "$set": {
+                        "last_seen":    now,
+                        "last_verdict": verdict_upper,
+                        "flagged":      verdict_upper == "HIGH_RISK",
+                    },
+                    "$setOnInsert": {
+                        "first_seen": now,
+                    },
+                },
+                upsert=True,
+            )
+            logger.debug(f"Threat memory updated: domain={domain} verdict={verdict_upper}")
+
+        except Exception as e:
+            logger.debug(f"Threat memory record skipped: {e}")
+
+    @staticmethod
+    async def check_duplicate_image(image_hash: str) -> Optional[dict]:
+        """
+        Check if this exact image was scanned before (by MD5 hash).
+        Returns previous scan result or None.
+        """
+        try:
+            db  = get_db()
+            doc = await db.scans.find_one(
+                {"image_hash": image_hash},
+                sort=[("timestamp", -1)]    # most recent first
+            )
+            if doc:
+                return {
+                    "duplicate":      True,
+                    "previous_scan":  doc.get("scan_id"),
+                    "previous_verdict": doc.get("verdict"),
+                    "scanned_at":     doc.get("timestamp", "").isoformat()
+                                      if isinstance(doc.get("timestamp"), datetime)
+                                      else doc.get("timestamp"),
+                }
+            return None
+
+        except Exception as e:
+            logger.debug(f"Duplicate check skipped: {e}")
+            return None
+
+    @staticmethod
+    async def save_scan(scan_doc: dict):
+        """
+        Save full scan document to the scans collection.
+        """
+        try:
+            db = get_db()
+            await db.scans.insert_one(scan_doc)
+            logger.debug(f"Scan saved: scan_id={scan_doc.get('scan_id')}")
+        except Exception as e:
+            logger.debug(f"DB save skipped: {e}")
